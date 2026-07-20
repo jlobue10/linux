@@ -37,6 +37,7 @@
 #include <linux/stddef.h>
 #include <linux/sysfs.h>
 #include <linux/leds.h>
+#include <linux/led-class-multicolor.h>
 
 #include "hid-ids.h"
 
@@ -123,6 +124,16 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define QUIRK_ROG_ALLY_XPAD		BIT(13)
 #define QUIRK_HID_FN_LOCK		BIT(14)
 
+/* Ally LED report commands */
+#define ASUS_USB_RGB_CMD_CONFIG	0xb3
+#define ASUS_USB_RGB_CMD_APPLY	0xb4
+#define ASUS_USB_RGB_CMD_SET	0xb5
+
+/* Ally LED effect speed (hardware register values) */
+#define ASUS_USB_RGB_SPEED_SLOW	0xe1
+#define ASUS_USB_RGB_SPEED_MED	0xe4
+#define ASUS_USB_RGB_SPEED_FAST	0xef
+
 #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
 						 QUIRK_NO_INIT_REPORTS | \
 						 QUIRK_NO_CONSUMER_USAGES)
@@ -170,6 +181,91 @@ struct asus_touchpad_info {
 	int contact_size;
 	int max_contacts;
 	int report_size;
+};
+
+enum asus_aura_zone {
+	ASUS_AURA_ZONE_NONE = 0,
+	ASUS_AURA_ZONE_KEY1 = 1,
+	ASUS_AURA_ZONE_KEY2 = 2,
+	ASUS_AURA_ZONE_KEY3 = 3,
+	ASUS_AURA_ZONE_KEY4 = 4,
+	ASUS_AURA_ZONE_LOGO = 5,
+	ASUS_AURA_ZONE_BAR_LEFT = 6,
+	ASUS_AURA_ZONE_BAR_RIGHT = 7,
+	ASUS_AURA_ZONE_MAX,
+};
+
+enum asus_usb_rgb_effect {
+	ASUS_USB_RGB_EFFECT_STATIC = 0,
+	ASUS_USB_RGB_EFFECT_BREATHING = 1,
+	ASUS_USB_RGB_EFFECT_COLOR_CYCLE = 2,
+	ASUS_USB_RGB_EFFECT_RAINBOW = 3,
+	ASUS_USB_RGB_EFFECT_COUNT,
+};
+
+/* Ally LED effect packet (command 0xb3) */
+struct asus_usb_rgb_report {
+	u8 report_id;
+	u8 cmd;
+	u8 zone;
+	u8 effect;
+	u8 red;
+	u8 green;
+	u8 blue;
+	u8 speed;
+	u8 direction;
+	u8 pad1;
+	u8 bg_red;
+	u8 bg_green;
+	u8 bg_blue;
+} __packed;
+
+struct asus_usb_rgb_zone_state {
+	enum asus_usb_rgb_effect effect;
+	u8 speed;
+	u8 red;
+	u8 green;
+	u8 blue;
+	u8 brightness;
+	bool enabled;
+	bool initialized;
+};
+
+#define ASUS_RGB_HW_MAX_ZONES 8
+
+struct asus_usb_rgb_hw_desc {
+	const char *name;
+	enum asus_aura_zone zones[ASUS_RGB_HW_MAX_ZONES];
+	u8 zone_count;
+	u8 effect_report_id;
+	u8 config_cmd;
+	u8 set_cmd;
+	u8 apply_cmd;
+};
+
+struct asus_usb_rgb_dev;
+
+struct asus_usb_rgb_zone {
+	struct asus_usb_rgb_dev *parent;
+	enum asus_aura_zone zone_id;
+	struct led_classdev_mc mc_cdev;
+	struct mc_subled subled_info[3];
+	struct delayed_work work;
+	spinlock_t lock;
+	bool removed;
+	bool update_color;
+	bool update_effect;
+};
+
+struct asus_usb_rgb_dev {
+	struct hid_device *hdev;
+	const struct asus_usb_rgb_hw_desc *desc;
+	struct delayed_work resume_work;
+	struct mutex io_mutex;
+	spinlock_t lock;
+	bool removed;
+	struct asus_usb_rgb_zone_state zone_state[ASUS_AURA_ZONE_MAX];
+	struct asus_usb_rgb_zone zones[ASUS_RGB_HW_MAX_ZONES];
 };
 
 struct ally_joystick_resp_curve_param {
@@ -368,6 +464,7 @@ struct asus_drvdata {
 	struct input_dev *input;
 	struct input_dev *tp_kbd_input;
 	struct asus_kbd_leds *kbd_backlight;
+	struct asus_usb_rgb_dev *usb_rgb_dev;
 	struct ally_handheld *rog_ally;
 	const struct asus_touchpad_info *tp;
 	struct power_supply *battery;
@@ -478,6 +575,44 @@ static const u8 ally_gamepad_mode[] = {
 	ALLY_GAMEPAD_MODE_KEYBOARD
 };
 
+static const char *const asus_usb_rgb_effect_strings[] = {
+	[ASUS_USB_RGB_EFFECT_STATIC] = "static",
+	[ASUS_USB_RGB_EFFECT_BREATHING] = "breathing",
+	[ASUS_USB_RGB_EFFECT_COLOR_CYCLE] = "color_cycle",
+	[ASUS_USB_RGB_EFFECT_RAINBOW] = "rainbow",
+};
+
+static const struct asus_usb_rgb_hw_desc asus_usb_rgb_hw_ally = {
+	.name = "rog_ally",
+	.zones = {
+		ASUS_AURA_ZONE_KEY1,
+		ASUS_AURA_ZONE_KEY2,
+		ASUS_AURA_ZONE_KEY3,
+		ASUS_AURA_ZONE_KEY4,
+	},
+	.zone_count = 4,
+	.effect_report_id = FEATURE_KBD_REPORT_ID,
+	.config_cmd = ASUS_USB_RGB_CMD_CONFIG,
+	.set_cmd = ASUS_USB_RGB_CMD_SET,
+	.apply_cmd = ASUS_USB_RGB_CMD_APPLY,
+};
+
+struct asus_usb_rgb_hw_match {
+	u16 product_id;
+	const struct asus_usb_rgb_hw_desc *desc;
+};
+
+static const struct asus_usb_rgb_hw_match asus_usb_rgb_hw_matches[] = {
+	{
+		.product_id = USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY,
+		.desc = &asus_usb_rgb_hw_ally,
+	},
+	{
+		.product_id = USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY_X,
+		.desc = &asus_usb_rgb_hw_ally,
+	},
+};
+
 /* XInput rumble magnitudes use the hardware's 0..100 intensity range. */
 #define ALLY_FF_MAX_INTENSITY 100
 
@@ -541,6 +676,601 @@ static void ally_resume_work_fn(struct work_struct *work)
 		input_report_key(ally->ally_x_input, KEY_PROG1, 0);
 		input_sync(ally->ally_x_input);
 	}
+}
+
+static const char *asus_usb_rgb_zone_name(enum asus_aura_zone zone)
+{
+	switch (zone) {
+	case ASUS_AURA_ZONE_KEY1:
+		return "key1";
+	case ASUS_AURA_ZONE_KEY2:
+		return "key2";
+	case ASUS_AURA_ZONE_KEY3:
+		return "key3";
+	case ASUS_AURA_ZONE_KEY4:
+		return "key4";
+	case ASUS_AURA_ZONE_LOGO:
+		return "logo";
+	case ASUS_AURA_ZONE_BAR_LEFT:
+		return "bar_left";
+	case ASUS_AURA_ZONE_BAR_RIGHT:
+		return "bar_right";
+	default:
+		return "none";
+	}
+}
+
+static u8 asus_usb_rgb_speed_to_hw(u8 speed)
+{
+	if (speed <= 33)
+		return ASUS_USB_RGB_SPEED_SLOW;
+	if (speed <= 66)
+		return ASUS_USB_RGB_SPEED_MED;
+	return ASUS_USB_RGB_SPEED_FAST;
+}
+
+static void asus_usb_rgb_zone_state_default(struct asus_usb_rgb_zone_state *state,
+					      enum asus_aura_zone zone)
+{
+	state->effect = ASUS_USB_RGB_EFFECT_STATIC;
+	state->speed = 50;
+	state->brightness = 100;
+	state->enabled = true;
+
+	switch (zone) {
+	case ASUS_AURA_ZONE_KEY1:
+		state->red = 0xff;
+		state->green = 0x00;
+		state->blue = 0x00;
+		break;
+	case ASUS_AURA_ZONE_KEY2:
+		state->red = 0x9b;
+		state->green = 0x26;
+		state->blue = 0xb6;
+		break;
+	case ASUS_AURA_ZONE_KEY3:
+		state->red = 0x00;
+		state->green = 0x00;
+		state->blue = 0xff;
+		break;
+	default:
+		state->red = 0x00;
+		state->green = 0x7c;
+		state->blue = 0x80;
+		break;
+	}
+
+	state->initialized = true;
+}
+
+static struct asus_usb_rgb_zone_state *asus_usb_rgb_get_zone_state(struct asus_usb_rgb_dev *rgb,
+							   enum asus_aura_zone zone)
+{
+	struct asus_usb_rgb_zone_state *state;
+
+	if (!rgb || zone <= ASUS_AURA_ZONE_NONE || zone >= ASUS_AURA_ZONE_MAX)
+		return NULL;
+
+	state = &rgb->zone_state[zone];
+	if (!state->initialized)
+		asus_usb_rgb_zone_state_default(state, zone);
+
+	return state;
+}
+
+static bool asus_usb_rgb_can_initialize(const struct asus_drvdata *drvdata,
+					bool is_vendor)
+{
+	return is_vendor && drvdata &&
+		(drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
+		drvdata->kbd_backlight;
+}
+
+static const struct asus_usb_rgb_hw_desc *asus_usb_rgb_match_hw(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_usb_rgb_hw_matches); i++) {
+		if (asus_usb_rgb_hw_matches[i].product_id == hdev->product)
+			return asus_usb_rgb_hw_matches[i].desc;
+	}
+
+	/*
+	 * Keep quirk-driven assignment only as a fallback so product tables remain
+	 * the primary source of zone assignments for current and future platforms.
+	 */
+	if (drvdata && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT))
+		return &asus_usb_rgb_hw_ally;
+
+	return NULL;
+}
+
+static struct asus_usb_rgb_zone *asus_usb_rgb_zone_from_dev(struct device *dev)
+{
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+	struct led_classdev_mc *mc_cdev;
+
+	if (!led_cdev)
+		return NULL;
+
+	mc_cdev = lcdev_to_mccdev(led_cdev);
+	return container_of(mc_cdev, struct asus_usb_rgb_zone, mc_cdev);
+}
+
+static int asus_usb_rgb_send_zone_effect(struct asus_usb_rgb_zone *zone)
+{
+	struct asus_usb_rgb_dev *rgb = zone->parent;
+	struct asus_usb_rgb_zone_state *state = asus_usb_rgb_get_zone_state(rgb,
+								   zone->zone_id);
+	struct asus_usb_rgb_report report;
+	u8 out[ROG_ALLY_REPORT_SIZE] = {};
+	u8 set_buf[ROG_ALLY_REPORT_SIZE] = {
+		rgb->desc->effect_report_id,
+		rgb->desc->set_cmd,
+	};
+	int ret;
+
+	if (!state)
+		return -EINVAL;
+
+	if (!rgb || rgb->removed || !rgb->hdev)
+		return -ENODEV;
+
+	memset(&report, 0, sizeof(report));
+	report.report_id = rgb->desc->effect_report_id;
+	report.cmd = rgb->desc->config_cmd;
+	report.zone = zone->zone_id;
+	report.effect = state->effect;
+	report.red = state->enabled ? zone->mc_cdev.subled_info[0].brightness : 0;
+	report.green = state->enabled ? zone->mc_cdev.subled_info[1].brightness : 0;
+	report.blue = state->enabled ? zone->mc_cdev.subled_info[2].brightness : 0;
+	report.speed = asus_usb_rgb_speed_to_hw(state->speed);
+	report.direction = 0x01;
+
+	memcpy(out, &report, sizeof(report));
+
+	scoped_guard(mutex, &rgb->io_mutex) {
+		ret = ally_dev_set_report(rgb->hdev, out, sizeof(out));
+		if (ret >= 0)
+			ret = ally_dev_set_report(rgb->hdev, set_buf, sizeof(set_buf));
+	}
+
+	return ret;
+}
+
+static int asus_usb_rgb_commit(struct asus_usb_rgb_dev *rgb)
+{
+	u8 apply_buf[ROG_ALLY_REPORT_SIZE] = {
+		rgb->desc->effect_report_id,
+		rgb->desc->apply_cmd,
+	};
+
+	if (!rgb || rgb->removed || !rgb->hdev)
+		return -ENODEV;
+
+	return ally_dev_set_report(rgb->hdev, apply_buf, sizeof(apply_buf));
+}
+
+static void asus_usb_rgb_zone_queue_update(struct asus_usb_rgb_zone *zone, bool effect_changed)
+{
+	scoped_guard(spinlock_irqsave, &zone->lock) {
+		if (zone->removed)
+			return;
+		zone->update_color = true;
+		if (effect_changed)
+			zone->update_effect = true;
+	}
+
+	queue_delayed_work(system_wq, &zone->work, msecs_to_jiffies(30));
+}
+
+static void asus_usb_rgb_zone_work_fn(struct work_struct *work)
+{
+	struct asus_usb_rgb_zone *zone = container_of(work, struct asus_usb_rgb_zone, work.work);
+	bool update;
+	int ret;
+
+	scoped_guard(spinlock_irqsave, &zone->lock) {
+		if (zone->removed)
+			return;
+		update = zone->update_color || zone->update_effect;
+		zone->update_color = false;
+		zone->update_effect = false;
+	}
+
+	if (!update)
+		return;
+
+	ret = asus_usb_rgb_send_zone_effect(zone);
+	if (ret < 0)
+		dev_err(&zone->parent->hdev->dev,
+			"Failed to set RGB effect for %s: %d\n",
+			asus_usb_rgb_zone_name(zone->zone_id), ret);
+}
+
+static void asus_usb_rgb_set(struct led_classdev *cdev, enum led_brightness brightness)
+{
+	struct led_classdev_mc *mc_cdev = lcdev_to_mccdev(cdev);
+	struct asus_usb_rgb_zone *zone = container_of(mc_cdev, struct asus_usb_rgb_zone, mc_cdev);
+	struct asus_usb_rgb_zone_state *state = asus_usb_rgb_get_zone_state(zone->parent,
+								   zone->zone_id);
+	bool changed;
+
+	if (!state)
+		return;
+
+	led_mc_calc_color_components(mc_cdev, brightness);
+
+	changed = state->red != mc_cdev->subled_info[0].intensity ||
+		state->green != mc_cdev->subled_info[1].intensity ||
+		state->blue != mc_cdev->subled_info[2].intensity;
+
+	state->red = mc_cdev->subled_info[0].intensity;
+	state->green = mc_cdev->subled_info[1].intensity;
+	state->blue = mc_cdev->subled_info[2].intensity;
+	state->brightness = brightness;
+	state->initialized = true;
+
+	asus_usb_rgb_zone_queue_update(zone, changed);
+}
+
+static ssize_t asus_usb_rgb_zone_effect_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	struct asus_usb_rgb_zone_state *state;
+
+	if (!zone)
+		return -ENODEV;
+
+	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
+	if (!state || state->effect >= ASUS_USB_RGB_EFFECT_COUNT)
+		return -EINVAL;
+
+	return sysfs_emit(buf, "%s\n", asus_usb_rgb_effect_strings[state->effect]);
+}
+
+static ssize_t asus_usb_rgb_zone_effect_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	struct asus_usb_rgb_zone_state *state;
+	int mode = -EINVAL;
+
+	if (!zone)
+		return -ENODEV;
+
+	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
+	if (!state)
+		return -EINVAL;
+
+	if (sysfs_streq(buf, "static") || sysfs_streq(buf, "monocolor"))
+		mode = ASUS_USB_RGB_EFFECT_STATIC;
+	else if (sysfs_streq(buf, "breathing") || sysfs_streq(buf, "breathe"))
+		mode = ASUS_USB_RGB_EFFECT_BREATHING;
+	else if (sysfs_streq(buf, "color_cycle") || sysfs_streq(buf, "chroma"))
+		mode = ASUS_USB_RGB_EFFECT_COLOR_CYCLE;
+	else if (sysfs_streq(buf, "rainbow"))
+		mode = ASUS_USB_RGB_EFFECT_RAINBOW;
+
+	if (mode < 0)
+		return mode;
+
+	state->effect = mode;
+	asus_usb_rgb_zone_queue_update(zone, true);
+
+	return count;
+}
+
+static ssize_t asus_usb_rgb_zone_effect_index_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	int i;
+	int len = 0;
+
+	for (i = 0; i < ARRAY_SIZE(asus_usb_rgb_effect_strings); i++)
+		len += sysfs_emit_at(buf, len, "%s%s",
+				    i ? " " : "", asus_usb_rgb_effect_strings[i]);
+
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+static ssize_t asus_usb_rgb_zone_speed_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	struct asus_usb_rgb_zone_state *state;
+
+	if (!zone)
+		return -ENODEV;
+
+	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
+	if (!state)
+		return -EINVAL;
+
+	return sysfs_emit(buf, "%u\n", state->speed);
+}
+
+static ssize_t asus_usb_rgb_zone_speed_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	struct asus_usb_rgb_zone_state *state;
+	u8 speed;
+	int ret;
+
+	if (!zone)
+		return -ENODEV;
+
+	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
+	if (!state)
+		return -EINVAL;
+
+	ret = kstrtou8(buf, 10, &speed);
+	if (ret)
+		return ret;
+
+	if (speed > 100)
+		return -EINVAL;
+
+	state->speed = speed;
+	asus_usb_rgb_zone_queue_update(zone, true);
+
+	return count;
+}
+
+static ssize_t asus_usb_rgb_zone_speed_range_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	return sysfs_emit(buf, "0-100\n");
+}
+
+static ssize_t asus_usb_rgb_zone_enabled_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	struct asus_usb_rgb_zone_state *state;
+
+	if (!zone)
+		return -ENODEV;
+
+	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
+	if (!state)
+		return -EINVAL;
+
+	return sysfs_emit(buf, "%u\n", state->enabled);
+}
+
+static ssize_t asus_usb_rgb_zone_enabled_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	struct asus_usb_rgb_zone_state *state;
+	bool enabled;
+	int ret;
+
+	if (!zone)
+		return -ENODEV;
+
+	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
+	if (!state)
+		return -EINVAL;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+
+	state->enabled = enabled;
+	asus_usb_rgb_zone_queue_update(zone, true);
+
+	return count;
+}
+
+static ssize_t asus_usb_rgb_zone_enabled_index_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	return sysfs_emit(buf, "0 1\n");
+}
+
+static ssize_t asus_usb_rgb_zone_name_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+
+	if (!zone)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%s\n", asus_usb_rgb_zone_name(zone->zone_id));
+}
+
+static ssize_t asus_usb_rgb_zone_supported_zones_show(struct device *dev,
+					       struct device_attribute *attr,
+					       char *buf)
+{
+	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
+	int i;
+	int len = 0;
+
+	if (!zone)
+		return -ENODEV;
+
+	for (i = 0; i < zone->parent->desc->zone_count; i++) {
+		len += sysfs_emit_at(buf, len, "%s%s",
+				    i ? " " : "",
+				    asus_usb_rgb_zone_name(zone->parent->desc->zones[i]));
+	}
+
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+static struct device_attribute dev_attr_asus_usb_rgb_zone_effect =
+	__ATTR(effect, 0644, asus_usb_rgb_zone_effect_show, asus_usb_rgb_zone_effect_store);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_effect_index =
+	__ATTR(effect_index, 0444, asus_usb_rgb_zone_effect_index_show, NULL);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_speed =
+	__ATTR(speed, 0644, asus_usb_rgb_zone_speed_show, asus_usb_rgb_zone_speed_store);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_speed_range =
+	__ATTR(speed_range, 0444, asus_usb_rgb_zone_speed_range_show, NULL);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_enabled =
+	__ATTR(enabled, 0644, asus_usb_rgb_zone_enabled_show, asus_usb_rgb_zone_enabled_store);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_enabled_index =
+	__ATTR(enabled_index, 0444, asus_usb_rgb_zone_enabled_index_show, NULL);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_name =
+	__ATTR(zone, 0444, asus_usb_rgb_zone_name_show, NULL);
+static struct device_attribute dev_attr_asus_usb_rgb_zone_supported_zones =
+	__ATTR(supported_zones, 0444, asus_usb_rgb_zone_supported_zones_show, NULL);
+
+static struct attribute *asus_usb_rgb_zone_attrs[] = {
+	&dev_attr_asus_usb_rgb_zone_effect.attr,
+	&dev_attr_asus_usb_rgb_zone_effect_index.attr,
+	&dev_attr_asus_usb_rgb_zone_speed.attr,
+	&dev_attr_asus_usb_rgb_zone_speed_range.attr,
+	&dev_attr_asus_usb_rgb_zone_enabled.attr,
+	&dev_attr_asus_usb_rgb_zone_enabled_index.attr,
+	&dev_attr_asus_usb_rgb_zone_name.attr,
+	&dev_attr_asus_usb_rgb_zone_supported_zones.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_usb_rgb_zone_attr_group = {
+	.attrs = asus_usb_rgb_zone_attrs,
+};
+
+static int asus_usb_rgb_register_zone(struct asus_usb_rgb_dev *rgb, int idx)
+{
+	struct asus_usb_rgb_zone *zone = &rgb->zones[idx];
+	struct asus_usb_rgb_zone_state *state;
+	struct led_classdev *cdev;
+	int ret;
+
+	zone->parent = rgb;
+	zone->zone_id = rgb->desc->zones[idx];
+
+	state = asus_usb_rgb_get_zone_state(rgb, zone->zone_id);
+	if (!state)
+		return -EINVAL;
+
+	zone->subled_info[0].color_index = LED_COLOR_ID_RED;
+	zone->subled_info[1].color_index = LED_COLOR_ID_GREEN;
+	zone->subled_info[2].color_index = LED_COLOR_ID_BLUE;
+
+	zone->mc_cdev.subled_info = zone->subled_info;
+	zone->mc_cdev.num_colors = ARRAY_SIZE(zone->subled_info);
+
+	cdev = &zone->mc_cdev.led_cdev;
+	cdev->name = devm_kasprintf(&rgb->hdev->dev, GFP_KERNEL,
+				   "asus:rgb:%s", asus_usb_rgb_zone_name(zone->zone_id));
+	if (!cdev->name)
+		return -ENOMEM;
+
+	cdev->brightness = state->brightness;
+	cdev->max_brightness = 100;
+	cdev->brightness_set = asus_usb_rgb_set;
+	cdev->color = LED_COLOR_ID_RGB;
+
+	zone->subled_info[0].intensity = state->red;
+	zone->subled_info[1].intensity = state->green;
+	zone->subled_info[2].intensity = state->blue;
+	led_mc_calc_color_components(&zone->mc_cdev, cdev->brightness);
+
+	spin_lock_init(&zone->lock);
+	INIT_DELAYED_WORK(&zone->work, asus_usb_rgb_zone_work_fn);
+
+	ret = devm_led_classdev_multicolor_register(&rgb->hdev->dev, &zone->mc_cdev);
+	if (ret)
+		return ret;
+
+	ret = devm_device_add_group(zone->mc_cdev.led_cdev.dev,
+				    &asus_usb_rgb_zone_attr_group);
+	if (ret && ret != -EEXIST)
+		return ret;
+
+	return 0;
+}
+
+static void asus_usb_rgb_resume_work_fn(struct work_struct *work)
+{
+	struct asus_usb_rgb_dev *rgb = container_of(work, struct asus_usb_rgb_dev,
+						resume_work.work);
+	int i;
+
+	if (!rgb || rgb->removed)
+		return;
+
+	for (i = 0; i < rgb->desc->zone_count; i++)
+		asus_usb_rgb_zone_queue_update(&rgb->zones[i], true);
+}
+
+static struct asus_usb_rgb_dev *asus_usb_rgb_create(struct hid_device *hdev)
+{
+	struct asus_usb_rgb_dev *rgb;
+	const struct asus_usb_rgb_hw_desc *desc;
+	int i;
+	int ret;
+
+	desc = asus_usb_rgb_match_hw(hdev);
+	if (!desc)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	rgb = devm_kzalloc(&hdev->dev, sizeof(*rgb), GFP_KERNEL);
+	if (!rgb)
+		return ERR_PTR(-ENOMEM);
+
+	rgb->hdev = hdev;
+	rgb->desc = desc;
+	mutex_init(&rgb->io_mutex);
+	spin_lock_init(&rgb->lock);
+	INIT_DELAYED_WORK(&rgb->resume_work, asus_usb_rgb_resume_work_fn);
+
+	for (i = 0; i < desc->zone_count; i++) {
+		ret = asus_usb_rgb_register_zone(rgb, i);
+		if (ret)
+			return ERR_PTR(ret);
+	}
+
+	for (i = 0; i < desc->zone_count; i++)
+		asus_usb_rgb_zone_queue_update(&rgb->zones[i], true);
+
+	return rgb;
+}
+
+static void asus_usb_rgb_remove(struct asus_usb_rgb_dev *rgb)
+{
+	int i;
+
+	if (!rgb || rgb->removed)
+		return;
+
+	scoped_guard(spinlock_irqsave, &rgb->lock)
+		rgb->removed = true;
+
+	cancel_delayed_work_sync(&rgb->resume_work);
+
+	for (i = 0; i < rgb->desc->zone_count; i++) {
+		struct asus_usb_rgb_zone *zone = &rgb->zones[i];
+
+		scoped_guard(spinlock_irqsave, &zone->lock)
+			zone->removed = true;
+
+		cancel_delayed_work_sync(&zone->work);
+		devm_led_classdev_multicolor_unregister(&rgb->hdev->dev, &zone->mc_cdev);
+	}
+}
+
+static void asus_usb_rgb_resume(struct asus_usb_rgb_dev *rgb)
+{
+	if (!rgb || rgb->removed)
+		return;
+
+	schedule_delayed_work(&rgb->resume_work, msecs_to_jiffies(1500));
 }
 
 /**
@@ -4766,6 +5496,26 @@ asus_resume_err:
 	return ret;
 }
 
+static int __maybe_unused asus_suspend(struct hid_device *hdev, pm_message_t message)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct asus_usb_rgb_dev *rgb = drvdata->usb_rgb_dev;
+	int i;
+	int ret;
+
+	if (!rgb)
+		return 0;
+
+	for (i = 0; i < rgb->desc->zone_count; i++)
+		cancel_delayed_work_sync(&rgb->zones[i].work);
+
+	ret = asus_usb_rgb_commit(rgb);
+	if (ret < 0)
+		hid_dbg(hdev, "Failed to commit RGB state on suspend: %d\n", ret);
+
+	return 0;
+}
+
 static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -4787,6 +5537,8 @@ static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 			return ret;
 		}
 	}
+
+	asus_usb_rgb_resume(drvdata->usb_rgb_dev);
 
 	return 0;
 }
@@ -4916,6 +5668,18 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			drvdata->rog_ally = ally;
 	}
 
+	if (!drvdata->usb_rgb_dev && asus_usb_rgb_can_initialize(drvdata, is_vendor)) {
+		drvdata->usb_rgb_dev = asus_usb_rgb_create(hdev);
+		if (IS_ERR(drvdata->usb_rgb_dev)) {
+			if (PTR_ERR(drvdata->usb_rgb_dev) != -EOPNOTSUPP)
+				hid_warn(hdev, "Failed to create zone RGB controls: %ld\n",
+					 PTR_ERR(drvdata->usb_rgb_dev));
+			drvdata->usb_rgb_dev = NULL;
+		} else {
+			hid_info(hdev, "Created per-zone RGB controls\n");
+		}
+	}
+
 	/*
 	 * For ROG keyboards, skip rename for consistency and ->input check as
 	 * some devices do not have inputs.
@@ -4952,6 +5716,11 @@ static void asus_remove(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	unsigned long flags;
+
+	if (drvdata->usb_rgb_dev) {
+		asus_usb_rgb_remove(drvdata->usb_rgb_dev);
+		drvdata->usb_rgb_dev = NULL;
+	}
 
 	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)
 		hid_asus_ally_remove(hdev, drvdata->rog_ally);
@@ -5158,6 +5927,7 @@ static struct hid_driver asus_driver = {
 	.input_configured       = asus_input_configured,
 	.reset_resume           = pm_ptr(asus_reset_resume),
 	.resume			= pm_ptr(asus_resume),
+	.suspend		= pm_ptr(asus_suspend),
 	.event			= asus_event,
 	.raw_event		= asus_raw_event
 };
