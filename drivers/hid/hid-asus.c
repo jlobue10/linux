@@ -5352,6 +5352,25 @@ static int asus_input_mapping(struct hid_device *hdev,
 	     usage->hid == (HID_UP_GENDEVCTRLS | 0x0026)))
 		return -1;
 
+	/* The Xbox Ally X sends its front-button long-press events as plain
+	 * keyboard usages F21/F22 instead of the original Ally's vendor codes
+	 * (0xA7/0x38). Remap them to the same F17/F19 those codes produce so
+	 * userspace sees consistent events across Ally generations.
+	 */
+	if ((drvdata->quirks & QUIRK_ROG_ALLY_XPAD) &&
+	    (usage->hid & HID_USAGE_PAGE) == HID_UP_KEYBOARD) {
+		switch (usage->hid & HID_USAGE) {
+		case 0x70: /* F21: left AC button long-press */
+			asus_map_key_clear(KEY_F17);
+			set_bit(EV_REP, hi->input->evbit);
+			return 1;
+		case 0x71: /* F22: right AC button long-press */
+			asus_map_key_clear(KEY_F19);
+			set_bit(EV_REP, hi->input->evbit);
+			return 1;
+		}
+	}
+
 	/* ASUS-specific keyboard hotkeys and led backlight */
 	if ((usage->hid & HID_USAGE_PAGE) == HID_UP_ASUSVENDOR) {
 		switch (usage->hid & HID_USAGE) {
