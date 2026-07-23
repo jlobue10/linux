@@ -3395,8 +3395,12 @@ static const struct btn_code_map *find_button_by_name(const char *name)
 static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld *ally,
 				  struct button_pair_map *mapping)
 {
+	/* The MCU mapping block is four consecutive 11-byte entries starting at
+	 * buf[5]: first remap 5-15, first macro 16-26, second remap 27-37,
+	 * second macro 38-48 (see hid-asus-ally __btn_pair_to_pkt, BTN_CODE_LEN).
+	 */
 	u8 macro_bytes[11] = {0};
-	u8 btn_bytes[10] = {0};
+	u8 btn_bytes[11] = {0};
 
 	if (!mapping)
 		return -EINVAL;
@@ -3419,23 +3423,30 @@ static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld
 		memset(btn_bytes, 0, sizeof(btn_bytes));
 		btn_bytes[0] = mapping->first.remap->type;
 
+		/* Value byte position depends on type: pad=1, kb=2, media=3,
+		 * mouse=4 (see hid-asus-ally BTN_CODE definitions).
+		 */
 		switch (mapping->first.remap->type) {
 		case BTN_TYPE_NONE:
 			break;
 		case BTN_TYPE_PAD:
+			btn_bytes[1] = mapping->first.remap->value;
+			break;
 		case BTN_TYPE_KB:
-		case BTN_TYPE_MEDIA:
 			btn_bytes[2] = mapping->first.remap->value;
+			break;
+		case BTN_TYPE_MEDIA:
+			btn_bytes[3] = mapping->first.remap->value;
 			break;
 		case BTN_TYPE_MOUSE:
 			btn_bytes[4] = mapping->first.remap->value;
 			break;
 		}
-		memcpy(&buf[5], btn_bytes, 10);
+		memcpy(&buf[5], btn_bytes, 11);
 	}
 
 	/* Macro mapping for first button if any */
-	buf[15] = mapping->first.macro->type;
+	buf[16] = mapping->first.macro->type;
 	if (mapping->first.macro->type) {
 		memset(macro_bytes, 0, sizeof(macro_bytes));
 		macro_bytes[0] = mapping->first.macro->type;
@@ -3444,15 +3455,19 @@ static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld
 		case BTN_TYPE_NONE:
 			break;
 		case BTN_TYPE_PAD:
+			macro_bytes[1] = mapping->first.macro->value;
+			break;
 		case BTN_TYPE_KB:
-		case BTN_TYPE_MEDIA:
 			macro_bytes[2] = mapping->first.macro->value;
+			break;
+		case BTN_TYPE_MEDIA:
+			macro_bytes[3] = mapping->first.macro->value;
 			break;
 		case BTN_TYPE_MOUSE:
 			macro_bytes[4] = mapping->first.macro->value;
 			break;
 		}
-		memcpy(&buf[15], macro_bytes, 11);
+		memcpy(&buf[16], macro_bytes, 11);
 	}
 
 	/* Second button mapping */
@@ -3466,19 +3481,23 @@ static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld
 		case BTN_TYPE_NONE:
 			break;
 		case BTN_TYPE_PAD:
+			btn_bytes[1] = mapping->second.remap->value;
+			break;
 		case BTN_TYPE_KB:
-		case BTN_TYPE_MEDIA:
 			btn_bytes[2] = mapping->second.remap->value;
+			break;
+		case BTN_TYPE_MEDIA:
+			btn_bytes[3] = mapping->second.remap->value;
 			break;
 		case BTN_TYPE_MOUSE:
 			btn_bytes[4] = mapping->second.remap->value;
 			break;
 		}
-		memcpy(&buf[27], btn_bytes, 10);
+		memcpy(&buf[27], btn_bytes, 11);
 	}
 
 	/* Macro mapping for second button if any */
-	buf[37] = mapping->second.macro->type;
+	buf[38] = mapping->second.macro->type;
 	if (mapping->second.macro->type) {
 		memset(macro_bytes, 0, sizeof(macro_bytes));
 		macro_bytes[0] = mapping->second.macro->type;
@@ -3487,15 +3506,19 @@ static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld
 		case BTN_TYPE_NONE:
 			break;
 		case BTN_TYPE_PAD:
+			macro_bytes[1] = mapping->second.macro->value;
+			break;
 		case BTN_TYPE_KB:
-		case BTN_TYPE_MEDIA:
 			macro_bytes[2] = mapping->second.macro->value;
+			break;
+		case BTN_TYPE_MEDIA:
+			macro_bytes[3] = mapping->second.macro->value;
 			break;
 		case BTN_TYPE_MOUSE:
 			macro_bytes[4] = mapping->second.macro->value;
 			break;
 		}
-		memcpy(&buf[37], macro_bytes, 11);
+		memcpy(&buf[38], macro_bytes, 11);
 	}
 
 	return ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
