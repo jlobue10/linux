@@ -860,9 +860,15 @@ static void asus_usb_rgb_zone_queue_update(struct asus_usb_rgb_zone *zone, bool 
 		zone->update_color = true;
 		if (effect_changed)
 			zone->update_effect = true;
-	}
 
-	queue_delayed_work(system_wq, &zone->work, msecs_to_jiffies(30));
+		/*
+		 * Queue while still holding the lock: remove sets
+		 * zone->removed under it before cancel_delayed_work_sync(),
+		 * so queueing after dropping the lock could re-arm the work
+		 * past the cancel and have it run on freed memory.
+		 */
+		queue_delayed_work(system_wq, &zone->work, msecs_to_jiffies(30));
+	}
 }
 
 static void asus_usb_rgb_zone_work_fn(struct work_struct *work)
@@ -1267,10 +1273,15 @@ static void asus_usb_rgb_remove(struct asus_usb_rgb_dev *rgb)
 
 static void asus_usb_rgb_resume(struct asus_usb_rgb_dev *rgb)
 {
-	if (!rgb || rgb->removed)
+	if (!rgb)
 		return;
 
-	schedule_delayed_work(&rgb->resume_work, msecs_to_jiffies(1500));
+	/* Same ordering constraint as asus_usb_rgb_zone_queue_update(). */
+	scoped_guard(spinlock_irqsave, &rgb->lock) {
+		if (rgb->removed)
+			return;
+		schedule_delayed_work(&rgb->resume_work, msecs_to_jiffies(1500));
+	}
 }
 
 /**
@@ -5548,8 +5559,16 @@ static int __maybe_unused asus_suspend(struct hid_device *hdev, pm_message_t mes
 	if (!rgb)
 		return 0;
 
+	/*
+	 * Flush, don't cancel: a color/effect update queued within the 30ms
+	 * debounce window before suspend must still reach the MCU before the
+	 * apply command commits the state. flush_delayed_work() kicks the
+	 * pending timer, so this does not wait out the debounce delay. The
+	 * resume work goes first since it only re-queues the zone works.
+	 */
+	flush_delayed_work(&rgb->resume_work);
 	for (i = 0; i < rgb->desc->zone_count; i++)
-		cancel_delayed_work_sync(&rgb->zones[i].work);
+		flush_delayed_work(&rgb->zones[i].work);
 
 	ret = asus_usb_rgb_commit(rgb);
 	if (ret < 0)
@@ -5750,6 +5769,15 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	return 0;
 err_stop_hw:
+	/*
+	 * The RGB zones arm delayed work as soon as they are created; tear
+	 * them down before devm unregisters the LED classdevs and frees the
+	 * allocation, or the pending work runs on freed memory.
+	 */
+	if (drvdata->usb_rgb_dev) {
+		asus_usb_rgb_remove(drvdata->usb_rgb_dev);
+		drvdata->usb_rgb_dev = NULL;
+	}
 	hid_hw_stop(hdev);
 	return ret;
 }
